@@ -32,6 +32,7 @@ from orchestrator.registry import (
     tool,
 )
 
+
 # Run async tests on asyncio (mirrors the pattern in test_bus.py).
 @pytest.fixture
 def anyio_backend():
@@ -141,7 +142,9 @@ class TestToolResult:
         assert r.is_error is False
 
     def test_error_result(self):
-        r = ToolResult(tool_name="t", input={}, output=None, error="boom", is_error=True)
+        r = ToolResult(
+            tool_name="t", input={}, output=None, error="boom", is_error=True
+        )
         assert r.is_error is True
         assert r.error == "boom"
         assert r.output is None
@@ -198,8 +201,14 @@ class TestToolRegistryRegistration:
         reg = ToolRegistry("a")
         manager = AsyncMock()
         manager.list_tools.return_value = [
-            ToolDefinition(name="search", description="Web search.", input_schema={"type": "object"}),
-            ToolDefinition(name="fetch", description="HTTP fetch.", input_schema={"type": "object"}),
+            ToolDefinition(
+                name="search",
+                description="Web search.",
+                input_schema={"type": "object"},
+            ),
+            ToolDefinition(
+                name="fetch", description="HTTP fetch.", input_schema={"type": "object"}
+            ),
         ]
         await reg.register_mcp("brave", manager)
         assert reg.has_tool("search")
@@ -396,6 +405,12 @@ class TestMCPServerManager:
             await manager.call_tool("mock", "echo", {"message": "hi"})
 
     @pytest.mark.anyio
+    async def test_call_tool_jsonrpc_error_is_mcp_tool_error(self, manager):
+        await manager.start("mock", command=_SERVER_CMD)
+        with pytest.raises(MCPToolError, match="Unknown tool"):
+            await manager.call_tool("mock", "not_a_real_tool", {})
+
+    @pytest.mark.anyio
     async def test_call_tool_not_running_raises(self, manager):
         with pytest.raises(KeyError):
             await manager.call_tool("nonexistent", "echo", {})
@@ -512,6 +527,19 @@ class TestLoadMcpRegistry:
         p.write_text(__import__("json").dumps(cfg))
         registry = load_mcp_registry(str(p))
         assert registry["filesystem"]["command"] == ["npx", "-y", "@mcp/fs", "/data"]
+
+    def test_accepts_string_command_without_char_split(self, tmp_path):
+        cfg = {
+            "timeutils": {
+                "command": "uvx",
+                "args": ["mcp-server-time@2026.1.26"],
+                "env": {},
+            }
+        }
+        p = tmp_path / "mcp_servers.json"
+        p.write_text(__import__("json").dumps(cfg))
+        registry = load_mcp_registry(str(p))
+        assert registry["timeutils"]["command"] == ["uvx", "mcp-server-time@2026.1.26"]
 
     def test_resolves_env_vars(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MY_API_KEY", "secret123")

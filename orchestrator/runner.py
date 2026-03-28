@@ -30,7 +30,7 @@ import anthropic as _anthropic
 from orchestrator.agent import Agent, AgentRepository, AgentState
 from orchestrator.bus import Message, MessageBus, MessageType
 from orchestrator.mcp import load_mcp_registry
-from orchestrator.registry import BudgetExceededError, ToolRegistry
+from orchestrator.registry import BudgetExceededError, ToolNotFoundError, ToolRegistry
 
 # ---------------------------------------------------------------------------
 # Claude Code SDK availability
@@ -43,10 +43,12 @@ _ClaudeCodeSession: Any = None
 
 try:
     from claude_code_sdk import ClaudeCodeSession as _ClaudeCodeSession  # type: ignore[no-redef]
+
     _SDK_AVAILABLE = True
 except ImportError:
     try:
         from anthropic.claude_code import ClaudeCodeSession as _ClaudeCodeSession  # type: ignore[no-redef]
+
         _SDK_AVAILABLE = True
     except ImportError:
         pass
@@ -61,7 +63,7 @@ class ClaudeCodeTask:
     prompt: str
     working_directory: str
     allowed_paths: list[str]
-    mcp_servers: list[str]           # server names from mcp_servers.json
+    mcp_servers: list[str]  # server names from mcp_servers.json
     max_turns: int = 10
     timeout_seconds: float = 300.0
 
@@ -77,7 +79,7 @@ class ClaudeCodeResult:
 
 @dataclass
 class ClaudeCodeEvent:
-    type: str   # "tool_use" | "turn_complete" | "file_modified" | "final"
+    type: str  # "tool_use" | "turn_complete" | "file_modified" | "final"
     data: dict = field(default_factory=dict)
 
 
@@ -188,12 +190,18 @@ class ClaudeCodeRunner:
             )
         except asyncio.TimeoutError:
             return ClaudeCodeResult(
-                success=False, final_response="", files_modified=[], turns_used=0,
+                success=False,
+                final_response="",
+                files_modified=[],
+                turns_used=0,
                 error="timeout",
             )
         except Exception as exc:  # noqa: BLE001
             return ClaudeCodeResult(
-                success=False, final_response="", files_modified=[], turns_used=0,
+                success=False,
+                final_response="",
+                files_modified=[],
+                turns_used=0,
                 error=str(exc),
             )
 
@@ -201,7 +209,8 @@ class ClaudeCodeRunner:
         cmd = [
             "claude",
             "--print",
-            "--max-turns", str(task.max_turns),
+            "--max-turns",
+            str(task.max_turns),
             task.prompt,
         ]
         self._logger.debug(
@@ -229,12 +238,18 @@ class ClaudeCodeRunner:
             )
         except asyncio.TimeoutError:
             return ClaudeCodeResult(
-                success=False, final_response="", files_modified=[], turns_used=0,
+                success=False,
+                final_response="",
+                files_modified=[],
+                turns_used=0,
                 error="timeout",
             )
         except Exception as exc:  # noqa: BLE001
             return ClaudeCodeResult(
-                success=False, final_response="", files_modified=[], turns_used=0,
+                success=False,
+                final_response="",
+                files_modified=[],
+                turns_used=0,
                 error=str(exc),
             )
 
@@ -320,6 +335,13 @@ class MessagesAPIRunner:
         if system:
             create_kwargs["system"] = system
         tools = self._registry.list_definitions()
+        self._logger.info(
+            "llm.tools_offered",
+            extra={
+                "count": len(tools),
+                "names": ",".join(sorted(t["name"] for t in tools)),
+            },
+        )
         if tools:
             create_kwargs["tools"] = tools
 
@@ -344,7 +366,10 @@ class MessagesAPIRunner:
                     if hasattr(block, "text"):
                         text = block.text
                         break
-                stats = {"iterations_used": iterations, "tool_calls_made": tool_calls_made}
+                stats = {
+                    "iterations_used": iterations,
+                    "tool_calls_made": tool_calls_made,
+                }
                 return text, messages, stats
 
             # Tool use — dispatch all tool calls in this turn
@@ -363,9 +388,53 @@ class MessagesAPIRunner:
                     span.set_attribute("agent.id", self._agent_id)
                     span.set_attribute("tool.name", block.name)
 
-                    result = await self._registry.call(block.name, block.input)
+                    self._logger.info(
+                        "tool.requested",
+                        extra={
+                            "tool": block.name,
+                            "available": ",".join(
+                                sorted(
+                                    t["name"] for t in self._registry.list_definitions()
+                                )
+                            ),
+                        },
+                    )
+
+                    try:
+                        result = await self._registry.call(block.name, block.input)
+                    except ToolNotFoundError as exc:
+                        self._logger.error(
+                            "tool.not_registered",
+                            extra={
+                                "requested": block.name,
+                                "available": ",".join(
+                                    sorted(
+                                        t["name"]
+                                        for t in self._registry.list_definitions()
+                                    )
+                                ),
+                            },
+                        )
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": str(exc),
+                                "is_error": True,
+                            }
+                        )
+                        continue
                     span.set_attribute("tool.is_error", result.is_error)
                     span.set_attribute("tool.duration_ms", result.duration_ms)
+
+                    if result.is_error:
+                        self._logger.warning(
+                            "tool.call_error",
+                            extra={
+                                "tool": block.name,
+                                "error": result.error or "tool error",
+                            },
+                        )
 
                 self._logger.debug(
                     "tool.called",
@@ -376,16 +445,18 @@ class MessagesAPIRunner:
                     },
                 )
 
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": (
-                        str(result.output)
-                        if not result.is_error
-                        else (result.error or "tool error")
-                    ),
-                    "is_error": result.is_error,
-                })
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": (
+                            str(result.output)
+                            if not result.is_error
+                            else (result.error or "tool error")
+                        ),
+                        "is_error": result.is_error,
+                    }
+                )
 
             messages = [
                 *messages,
@@ -444,17 +515,20 @@ async def run_worker(
                 if command == "TERMINATE":
                     repo.transition(agent.id, AgentState.IDLE, reason="pre-terminate")
                     repo.transition(
-                        agent.id, AgentState.TERMINATED,
+                        agent.id,
+                        AgentState.TERMINATED,
                         reason=reason or "control:terminate",
                     )
                 elif command == "SUSPEND":
                     repo.transition(
-                        agent.id, AgentState.SUSPENDED,
+                        agent.id,
+                        AgentState.SUSPENDED,
                         reason=reason or "control:suspend",
                     )
                 else:
                     repo.transition(
-                        agent.id, AgentState.IDLE,
+                        agent.id,
+                        AgentState.IDLE,
                         reason=f"control:{command.lower()}",
                     )
                 return
@@ -535,34 +609,39 @@ async def _run_claude_code_task(
     result = await runner.run(cc_task)
 
     if result.success:
-        await bus.send(Message(
-            type=MessageType.TASK_RESULT,
-            sender_id=agent.id,
-            recipient_id=agent.parent_id,
-            cluster_id=agent.cluster_id,
-            payload={
-                "task_id": task_id,
-                "output": result.final_response,
-                "files_modified": result.files_modified,
-                "turns_used": result.turns_used,
-            },
-        ))
+        await bus.send(
+            Message(
+                type=MessageType.TASK_RESULT,
+                sender_id=agent.id,
+                recipient_id=agent.parent_id,
+                cluster_id=agent.cluster_id,
+                payload={
+                    "task_id": task_id,
+                    "output": result.final_response,
+                    "files_modified": result.files_modified,
+                    "turns_used": result.turns_used,
+                },
+            )
+        )
         repo.transition(agent.id, AgentState.IDLE)
     else:
-        await bus.send(Message(
-            type=MessageType.TASK_ERROR,
-            sender_id=agent.id,
-            recipient_id=agent.parent_id,
-            cluster_id=agent.cluster_id,
-            payload={
-                "task_id": task_id,
-                "error_type": "ClaudeCodeFailed",
-                "message": result.error,
-                "retryable": True,
-            },
-        ))
+        await bus.send(
+            Message(
+                type=MessageType.TASK_ERROR,
+                sender_id=agent.id,
+                recipient_id=agent.parent_id,
+                cluster_id=agent.cluster_id,
+                payload={
+                    "task_id": task_id,
+                    "error_type": "ClaudeCodeFailed",
+                    "message": result.error,
+                    "retryable": True,
+                },
+            )
+        )
         repo.transition(
-            agent.id, AgentState.FAILED,
+            agent.id,
+            AgentState.FAILED,
             reason=result.error or "claude_code_failed",
             error={"type": "ClaudeCodeFailed", "message": result.error},
         )
@@ -590,35 +669,40 @@ async def _run_messages_api_task(
             max_tool_calls=agent.context.get("max_tool_calls", _DEFAULT_MAX_TOOL_CALLS),
             max_iterations=agent.context.get("max_iterations", _DEFAULT_MAX_ITERATIONS),
         )
-        await bus.send(Message(
-            type=MessageType.TASK_RESULT,
-            sender_id=agent.id,
-            recipient_id=agent.parent_id,
-            cluster_id=agent.cluster_id,
-            payload={
-                "task_id": task_id,
-                "output": final_text,
-                "iterations_used": stats["iterations_used"],
-                "tool_calls_made": stats["tool_calls_made"],
-            },
-        ))
+        await bus.send(
+            Message(
+                type=MessageType.TASK_RESULT,
+                sender_id=agent.id,
+                recipient_id=agent.parent_id,
+                cluster_id=agent.cluster_id,
+                payload={
+                    "task_id": task_id,
+                    "output": final_text,
+                    "iterations_used": stats["iterations_used"],
+                    "tool_calls_made": stats["tool_calls_made"],
+                },
+            )
+        )
         repo.transition(agent.id, AgentState.IDLE)
 
     except BudgetExceededError as exc:
-        await bus.send(Message(
-            type=MessageType.TASK_ERROR,
-            sender_id=agent.id,
-            recipient_id=agent.parent_id,
-            cluster_id=agent.cluster_id,
-            payload={
-                "task_id": task_id,
-                "error_type": "BudgetExceeded",
-                "message": str(exc),
-                "retryable": False,
-            },
-        ))
+        await bus.send(
+            Message(
+                type=MessageType.TASK_ERROR,
+                sender_id=agent.id,
+                recipient_id=agent.parent_id,
+                cluster_id=agent.cluster_id,
+                payload={
+                    "task_id": task_id,
+                    "error_type": "BudgetExceeded",
+                    "message": str(exc),
+                    "retryable": False,
+                },
+            )
+        )
         repo.transition(
-            agent.id, AgentState.FAILED,
+            agent.id,
+            AgentState.FAILED,
             reason=str(exc),
             error={"type": "BudgetExceeded", "message": str(exc)},
         )

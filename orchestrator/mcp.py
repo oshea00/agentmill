@@ -17,6 +17,7 @@ from typing import Any, Optional
 from orchestrator.registry import MCPServerCrashError, ToolDefinition
 
 _ENV_RE = re.compile(r"\$\{(\w+)\}")
+_STDIO_LIMIT_BYTES = 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -116,9 +117,7 @@ class _MCPProcess:
         while True:
             raw = await stdout.readline()
             if not raw:
-                raise MCPProtocolError(
-                    "MCP server process died (stdout closed)"
-                )
+                raise MCPProtocolError("MCP server process died (stdout closed)")
             envelope = json.loads(raw)
             if envelope.get("id") != expected_id:
                 continue  # skip notification or unrelated response
@@ -228,6 +227,10 @@ class MCPServerManager:
             )
         except MCPToolError:
             raise
+        except MCPProtocolError as exc:
+            if "JSON-RPC error from server:" in str(exc):
+                raise MCPToolError(str(exc)) from exc
+            pass  # process I/O/protocol failure — try restart below
         except Exception:
             pass  # protocol / process error — try restart below
 
@@ -247,9 +250,15 @@ class MCPServerManager:
             )
         except MCPToolError:
             raise
+        except MCPProtocolError as exc:
+            if "JSON-RPC error from server:" in str(exc):
+                raise MCPToolError(str(exc)) from exc
+            raise MCPServerCrashError(
+                f"MCP server '{server_name}' crashed again after restart: {exc}"
+            ) from exc
         except Exception as exc:
             raise MCPServerCrashError(
-                f"MCP server '{server_name}' crashed again after restart"
+                f"MCP server '{server_name}' crashed again after restart: {exc}"
             ) from exc
 
     # ------------------------------------------------------------------
@@ -272,6 +281,7 @@ class MCPServerManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             env=full_env,
+            limit=_STDIO_LIMIT_BYTES,
         )
         mcp_proc = _MCPProcess(proc)
         await mcp_proc.initialize()
@@ -323,6 +333,7 @@ def _resolve_env(raw: dict[str, str]) -> dict[str, str]:
     """
     resolved: dict[str, str] = {}
     for key, value in raw.items():
+
         def _sub(m: re.Match) -> str:
             var = m.group(1)
             if var not in os.environ:
@@ -350,7 +361,20 @@ def load_mcp_registry(path: str = "mcp_servers.json") -> dict[str, dict]:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     out: dict[str, dict] = {}
     for name, spec in raw.items():
-        command = list(spec.get("command", [])) + list(spec.get("args", []))
+        cmd_raw = spec.get("command", [])
+        args_raw = spec.get("args", [])
+
+        if isinstance(cmd_raw, str):
+            command = [cmd_raw]
+        else:
+            command = list(cmd_raw)
+
+        if isinstance(args_raw, str):
+            args = [args_raw]
+        else:
+            args = list(args_raw)
+
+        command = command + args
         env = _resolve_env(spec.get("env") or {})
         out[name] = {"command": command, "env": env}
     return out
