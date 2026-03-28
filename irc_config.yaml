@@ -1,0 +1,15 @@
+server:
+  host: "127.0.0.1"
+  port: 6667
+
+bot:
+  nick: "orchestrator"
+  channel: "#agents"
+
+trusted_nicks:
+  owner:
+    - "mike"
+  delegate: []
+
+timeouts:
+  interaction_wait_seconds: null   # null = wait indefinitely

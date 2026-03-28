@@ -1,0 +1,31 @@
+# Version control
+.git
+.gitignore
+
+# Python build artefacts
+__pycache__
+*.py[co]
+*.egg-info
+build/
+dist/
+wheels/
+.venv
+
+# Tests and specs (not needed in the image)
+tests/
+specs/
+
+# Runtime artefacts (written at runtime, not baked in)
+agents/instances/
+traces/
+*.db
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Secrets
+.env

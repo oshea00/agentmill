@@ -1,0 +1,70 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # agentmill — the orchestration framework
+  # ---------------------------------------------------------------------------
+  agentmill:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentmill:latest
+
+    environment:
+      # Required
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+
+      # Database (written inside the named volume)
+      DB_PATH: /data/agent_orchestrator.db
+
+      # OTel traces
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      OTLP_ENDPOINT: "${OTLP_ENDPOINT:-}"
+
+      # IRC gateway — server is managed outside this compose project.
+      # Set IRC_HOST to the address of your IRC server.  When running on
+      # Linux with host networking disabled, use the special DNS name
+      # host.docker.internal to reach the host machine.
+      IRC_HOST: "${IRC_HOST:-host.docker.internal}"
+      IRC_PORT: "${IRC_PORT:-6667}"
+      IRC_NICK: "${IRC_NICK:-orchestrator}"
+      IRC_CHANNEL: "${IRC_CHANNEL:-#agents}"
+
+      # Optional MCP server credentials (referenced as ${VAR} in mcp_servers.json)
+      BRAVE_API_KEY: "${BRAVE_API_KEY:-}"
+      DATABASE_URL: "${DATABASE_URL:-}"
+
+    volumes:
+      # Persistent data: SQLite database and OTel trace files
+      - agentmill_data:/data
+
+      # Agent instance files written at runtime (gitignored on the host)
+      - agentmill_instances:/app/agents/instances
+
+      # uv cache so MCP server packages are not re-downloaded on every start
+      - agentmill_uv_cache:/root/.cache/uv
+
+      # Bind-mount config files so they can be edited without rebuilding
+      - ./mcp_servers.json:/app/mcp_servers.json:ro
+      - ./irc_config.yaml:/app/irc_config.yaml:ro
+
+      # Bind-mount templates so edits are picked up on container restart
+      - ./agents/templates:/app/agents/templates:ro
+
+    # Allow the container to reach a locally running IRC server on the host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    restart: unless-stopped
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  agentmill_data:
+    driver: local
+
+  agentmill_instances:
+    driver: local
+
+  agentmill_uv_cache:
+    driver: local
