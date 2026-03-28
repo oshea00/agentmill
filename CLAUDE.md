@@ -26,6 +26,8 @@ spec before implementing any feature in its domain.
 
 | File | Domain | Key abstractions |
 |---|---|---|
+| `specs/spec-agent-configuration.md` | Config file format, templates, instances, change management | `AgentConfig`, `AgentConfigLoader`, `resolve_system_prompt` |
+| `specs/spec-human-irc-gateway.md` | Human-in-the-loop via IRC, trusted nicks, interaction lifecycle | `IRCGateway`, `TrustedNickRegistry`, `InteractionRequest`, `InteractionResponse` |
 | `specs/spec-agent-lifecycle.md` | Agent FSM, state persistence | `Agent`, `AgentState`, `AgentRepository` |
 | `specs/spec-inter-agent-communication.md` | Message bus, delivery guarantees | `Message`, `MessageType`, `MessageBus` |
 | `specs/spec-tool-mcp-integration.md` | Native tools, MCP servers, tool loop | `ToolDefinition`, `ToolRegistry`, `MCPServerManager` |
@@ -39,15 +41,28 @@ spec before implementing any feature in its domain.
 ```
 .
 ├── CLAUDE.md                    ← you are here
+├── irc_config.yaml              ← trusted nicks, IRC connection settings
+├── docker-compose.yml           ← ngircd on 127.0.0.1:6667
+├── ngircd.conf                  ← ngircd configuration
 ├── mcp_servers.json             ← MCP server registry (shared by framework + Claude Code)
+├── agents/
+│   ├── templates/               ← human-authored, committed to git (source of truth)
+│   │   ├── researcher.md
+│   │   ├── coder.md
+│   │   └── summariser.md
+│   └── instances/               ← orchestrator-generated at runtime (gitignored)
+│       └── <agent-id>.md
 ├── specs/
 │   ├── spec-agent-lifecycle.md
 │   ├── spec-inter-agent-communication.md
+│   ├── spec-human-irc-gateway.md
 │   ├── spec-tool-mcp-integration.md
 │   ├── spec-observability.md
 │   └── spec-claude-code-sdk.md
 ├── orchestrator/
 │   ├── __init__.py
+│   ├── config.py                ← AgentConfig, AgentConfigLoader, resolve_system_prompt
+│   ├── irc_gateway.py           ← IRCGateway, TrustedNickRegistry, InteractionRequest/Response
 │   ├── agent.py                 ← Agent dataclass, AgentRole, AgentState, VALID_TRANSITIONS
 │   ├── repository.py            ← AgentRepository (SQLite)
 │   ├── bus.py                   ← MessageBus, Message, MessageType
@@ -100,9 +115,12 @@ The entire framework is async. Use `asyncio.wait_for` for all timeout
 enforcement (tool calls, Claude Code sessions, message receive). Never use
 blocking I/O on the event loop.
 
----
+### 7. Human interaction always goes through the IRC gateway
+Never bypass `IRCGateway.post_interaction()` to get human input. Never block
+an agent waiting for human input without first transitioning it to `SUSPENDED`.
+The gateway is the only sanctioned human ↔ agent interface.
 
-## Database
+
 
 SQLite file: `./agent_orchestrator.db`
 
@@ -137,6 +155,25 @@ via the console logger only.
 
 ---
 
+## Agent Configuration
+
+Agent types are defined as Markdown files with YAML frontmatter in
+`agents/templates/`. The frontmatter holds structured fields (tools, limits,
+role, version). The Markdown body is the system prompt, passed verbatim to
+Claude. Templates are versioned with semver — bump PATCH for wording tweaks,
+MINOR for tool/limit changes, MAJOR for breaking schema changes.
+
+At spawn time, the orchestrator:
+1. Loads and validates the template via `AgentConfigLoader.load_template(name)`.
+2. Resolves `{{ variable }}` placeholders in the system prompt body.
+3. Writes the resolved instance file to `agents/instances/<agent-id>.md`.
+4. Creates the `Agent` DB row and begins the lifecycle FSM.
+
+All templates are validated at framework startup. A single invalid template is
+a hard startup error.
+
+---
+
 ## MCP Servers
 
 All MCP server definitions live in `mcp_servers.json` at the project root.
@@ -168,6 +205,10 @@ mode at runtime.
 | Variable | Required | Purpose |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Yes | Anthropic API access |
+| `IRC_HOST` | No | ngircd host (default: `127.0.0.1`) |
+| `IRC_PORT` | No | ngircd port (default: `6667`) |
+| `IRC_NICK` | No | Bot nick (default: `orchestrator`) |
+| `IRC_CHANNEL` | No | Human interaction channel (default: `#agents`) |
 | `OTLP_ENDPOINT` | No | Remote OTel collector (e.g. `http://localhost:4318`) |
 | `DB_PATH` | No | SQLite file path (default: `./agent_orchestrator.db`) |
 | `LOG_LEVEL` | No | Console log level (default: `INFO`) |
@@ -177,6 +218,12 @@ mode at runtime.
 
 ## What To Avoid
 
+- **Do not** process IRC messages from untrusted nicks — the trust gate in `_dispatch()` must run before any command handling.
+- **Do not** call an LLM from inside `IRCGateway` — the gateway routes; agents reason.
+- **Do not** use `threading` or `time.sleep` in the gateway rewrite — use `asyncio` equivalents throughout.
+- **Do not** edit an instance file after the agent has been spawned — instances are immutable; re-spawn with an updated template instead.
+- **Do not** commit `agents/instances/` — instance files are runtime artefacts; git tracks templates only.
+- **Do not** change a template's `role` or `execution_mode` without a MAJOR version bump — these are breaking changes.
 - **Do not** use `threading` — `asyncio` only.
 - **Do not** store sensitive data (API keys, file contents, tool outputs) in
   OTel span attributes.
