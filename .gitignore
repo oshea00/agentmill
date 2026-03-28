@@ -16,3 +16,5 @@ traces/
 
 # Secrets
 .env
+
+mcp_servers.json
