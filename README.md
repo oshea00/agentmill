@@ -945,3 +945,102 @@ Architectural decisions are documented in `specs/`. Read the relevant spec befor
 | `spec-claude-code-sdk.md` | ClaudeCodeRunner, worker integration |
 | `spec-agent-configuration.md` | Config file format, templates, instances |
 | `spec-observability.md` | OTel tracing, console logging |
+
+
+## Architecture Example
+
+![orchestration](images/agent_orchestration.gif)
+
+```mermaid
+sequenceDiagram
+    participant main as main()
+    participant cfg as AgentConfigLoader
+    participant repo as AgentRepository<br/>(SQLite)
+    participant bus as MessageBus<br/>(SQLite)
+    participant mcp as MCPServerManager
+    participant brave as brave-search<br/>(MCP subprocess)
+    participant reg as ToolRegistry
+    participant runner as MessagesAPIRunner
+    participant claude as Claude API
+
+    Note over main,repo: Phase 1 — Infrastructure
+    main->>repo: get_connection() / init_schema()
+    main->>cfg: load_template("researcher")
+    cfg-->>main: AgentConfig (researcher.md)
+    main->>main: resolve_system_prompt({{ task_description }})
+
+    Note over main,repo: Phase 2 — Agent Creation
+    main->>repo: create(orchestrator)
+    main->>repo: transition(CREATED → INITIALIZING → IDLE)
+    main->>repo: create(worker, parent=orchestrator)
+    main->>repo: transition(CREATED → INITIALIZING → IDLE)
+
+    Note over main,brave: Phase 3 — MCP & Tool Setup
+    main->>mcp: start("brave-search", cmd, env)
+    mcp->>brave: spawn subprocess
+    mcp->>brave: initialize (JSON-RPC 2.0)
+    brave-->>mcp: initialized ack
+
+    main->>reg: new ToolRegistry(worker.id)
+    main->>reg: register_mcp("brave-search", mcp_mgr)
+    reg->>mcp: list_tools("brave-search")
+    mcp->>brave: tools/list
+    brave-->>mcp: tool schemas
+    mcp-->>reg: [ToolDefinition, …]
+    Note over reg: Tools now available<br/>for Claude to call
+
+    Note over main,runner: Phase 4 — Runner Assembly
+    main->>runner: new MessagesAPIRunner(worker.id, client, registry)
+
+    Note over main,bus: Phase 5 — Task Dispatch
+    main->>bus: send(TASK_ASSIGN → worker)<br/>payload: "Python 3.13 features?"
+
+    Note over main,claude: Phase 6 — run_worker (task cycle)
+    main->>repo: transition(worker, IDLE → RUNNING)
+    main->>bus: receive(worker.id)
+    bus-->>main: TASK_ASSIGN message
+    main->>bus: acknowledge(msg)
+
+    rect rgb(231, 238, 240, 0)
+        Note over runner,claude: _run_messages_api_task → run_turn loop
+        main->>runner: run_turn(messages, system=researcher prompt)
+
+        loop until stop_reason ≠ tool_use
+            runner->>claude: messages.create(tools=[brave_web_search, …])
+            claude-->>runner: response (stop_reason: tool_use)
+            runner->>reg: call("brave_web_search", {query: …})
+            reg->>mcp: call_tool("brave-search", "brave_web_search", …)
+            mcp->>brave: tools/call (JSON-RPC)
+            brave-->>mcp: search results
+            mcp-->>reg: raw content
+            reg-->>runner: ToolResult
+            Note over runner: Append assistant + tool_result<br/>to messages, loop
+        end
+
+        runner->>claude: messages.create(… with tool results)
+        claude-->>runner: response (stop_reason: end_turn, text)
+        runner-->>main: (final_text, messages, stats)
+    end
+
+    main->>bus: send(TASK_RESULT → orchestrator)
+    main->>repo: transition(worker, RUNNING → IDLE)
+
+    Note over main,bus: Phase 7 — Collect Result
+    main->>bus: receive(orchestrator.id)
+    bus-->>main: TASK_RESULT message
+    main->>bus: acknowledge(result)
+    main->>main: print research output
+
+    Note over main,brave: Phase 8 — Clean Shutdown
+    main->>bus: send(CONTROL/TERMINATE → worker)
+
+    Note over main: run_worker (terminate cycle)
+    main->>repo: transition(worker, IDLE → RUNNING)
+    main->>bus: receive(worker.id)
+    bus-->>main: CONTROL message
+    main->>repo: transition(worker, RUNNING → IDLE)
+    main->>repo: transition(worker, IDLE → TERMINATED)
+
+    main->>mcp: stop_all()
+    mcp->>brave: close stdin / kill
+```
