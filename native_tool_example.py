@@ -1,4 +1,12 @@
+"""Native tool example: register a local @tool function and run one task.
+
+Unlike the template-driven examples (research_agent_orchestrator,
+multiple_task_orchestrator) this wires a Python-defined tool directly into the
+ToolRegistry — no agent template or MCP server involved.
+"""
+
 import asyncio
+
 import anthropic
 from opentelemetry import trace
 
@@ -9,7 +17,8 @@ from orchestrator.bus import Message, MessageBus, MessageType
 from orchestrator.registry import ToolRegistry, tool
 from orchestrator.runner import MessagesAPIRunner, run_worker
 
-# --- Tool definition ---
+# --- Native tool definition ---
+
 
 @tool(
     name="echo",
@@ -24,10 +33,10 @@ async def echo(input: dict) -> str:
     return input["text"]
 
 
-async def main():
-    init_tracing("example")
-    tracer = trace.get_tracer("example")
-    logger = get_logger("example")
+async def main() -> None:
+    init_tracing("native_tool_example")
+    tracer = trace.get_tracer("native_tool_example")
+    logger = get_logger("native_tool_example")
 
     conn = get_connection("./agent_orchestrator.db")
     init_schema(conn)
@@ -55,7 +64,7 @@ async def main():
     repo.transition(worker.id, AgentState.INITIALIZING)
     repo.transition(worker.id, AgentState.IDLE)
 
-    # Build the runner with the echo tool
+    # Register native tool and build the runner
     registry = ToolRegistry(agent_id=worker.id)
     registry.register_native(echo._tool_meta)
 
@@ -68,17 +77,23 @@ async def main():
     )
 
     # Send a task
-    await bus.send(Message(
-        type=MessageType.TASK_ASSIGN,
-        sender_id=orch.id,
-        recipient_id=worker.id,
-        cluster_id="demo",
-        payload={"task_id": "t-001", "description": "Echo back: hello world"},
-    ))
+    await bus.send(
+        Message(
+            type=MessageType.TASK_ASSIGN,
+            sender_id=orch.id,
+            recipient_id=worker.id,
+            cluster_id="demo",
+            payload={"task_id": "t-001", "description": "Echo back: hello world"},
+        )
+    )
 
     # Run one task cycle
     await run_worker(
-        worker, bus, repo, tracer, logger,
+        worker,
+        bus,
+        repo,
+        tracer,
+        logger,
         api_runner=runner,
         receive_timeout=10.0,
     )
@@ -90,4 +105,5 @@ async def main():
         await bus.acknowledge(result.id)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

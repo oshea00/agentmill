@@ -17,8 +17,9 @@ A Python framework for orchestrating clusters of Claude-powered agents. Agents c
   - [Agent configuration files](#agent-configuration-files)
   - [Observability](#observability)
 - [Examples](#examples)
-  - [Running a single agent](#running-a-single-agent)
-  - [Orchestrator spawning workers](#orchestrator-spawning-workers)
+  - [Native tool example](#native-tool-example)
+  - [Template-driven research task](#template-driven-research-task)
+  - [Multiple tasks](#multiple-tasks)
   - [Claude Code worker](#claude-code-worker)
   - [Human approval gate](#human-approval-gate)
 - [Configuration reference](#configuration-reference)
@@ -505,22 +506,15 @@ Console output format:
 
 ## Examples
 
-### Running a single agent
+### Native tool example
+
+The simplest example — a `@tool`-decorated Python function wired directly into the `ToolRegistry`, no agent template or MCP server. See [`native_tool_example.py`](native_tool_example.py).
 
 ```python
-import asyncio
-import anthropic
-from opentelemetry import trace
-
-from orchestrator.telemetry import init_tracing, get_logger
-from orchestrator.db import get_connection, init_schema
-from orchestrator.agent import Agent, AgentRole, AgentState, AgentRepository
-from orchestrator.bus import Message, MessageBus, MessageType
 from orchestrator.registry import ToolRegistry, tool
 from orchestrator.runner import MessagesAPIRunner, run_worker
 
-# --- Tool definition ---
-
+# Define a native tool
 @tool(
     name="echo",
     description="Return the input string unchanged.",
@@ -533,145 +527,78 @@ from orchestrator.runner import MessagesAPIRunner, run_worker
 async def echo(input: dict) -> str:
     return input["text"]
 
+# Register it and build the runner
+registry = ToolRegistry(agent_id=worker.id)
+registry.register_native(echo._tool_meta)
 
-async def main():
-    init_tracing("example")
-    tracer = trace.get_tracer("example")
-    logger = get_logger("example")
+runner = MessagesAPIRunner(
+    agent_id=worker.id,
+    client=anthropic.AsyncAnthropic(),
+    registry=registry,
+    tracer=tracer,
+    logger=logger,
+)
 
-    conn = get_connection("./agent_orchestrator.db")
-    init_schema(conn)
-    repo = AgentRepository(conn)
-    bus = MessageBus(conn)
+# Send a task and run one cycle
+await bus.send(Message(
+    type=MessageType.TASK_ASSIGN,
+    sender_id=orch.id,
+    recipient_id=worker.id,
+    cluster_id="demo",
+    payload={"task_id": "t-001", "description": "Echo back: hello world"},
+))
+await run_worker(worker, bus, repo, tracer, logger, api_runner=runner)
 
-    # Create an orchestrator and a worker in the same cluster
-    orch = Agent(role=AgentRole.ORCHESTRATOR, cluster_id="demo")
-    repo.create(orch)
-    repo.transition(orch.id, AgentState.INITIALIZING)
-    repo.transition(orch.id, AgentState.IDLE)
-
-    worker = Agent(
-        role=AgentRole.WORKER,
-        cluster_id="demo",
-        parent_id=orch.id,
-        context={
-            "execution_mode": "messages_api",
-            "system_prompt": "You are a helpful assistant.",
-            "max_iterations": 5,
-            "max_tool_calls": 10,
-        },
-    )
-    repo.create(worker)
-    repo.transition(worker.id, AgentState.INITIALIZING)
-    repo.transition(worker.id, AgentState.IDLE)
-
-    # Build the runner with the echo tool
-    registry = ToolRegistry(agent_id=worker.id)
-    registry.register_native(echo._tool_meta)
-
-    runner = MessagesAPIRunner(
-        agent_id=worker.id,
-        client=anthropic.AsyncAnthropic(),
-        registry=registry,
-        tracer=tracer,
-        logger=logger,
-    )
-
-    # Send a task
-    await bus.send(Message(
-        type=MessageType.TASK_ASSIGN,
-        sender_id=orch.id,
-        recipient_id=worker.id,
-        cluster_id="demo",
-        payload={"task_id": "t-001", "description": "Echo back: hello world"},
-    ))
-
-    # Run one task cycle
-    await run_worker(
-        worker, bus, repo, tracer, logger,
-        api_runner=runner,
-        receive_timeout=10.0,
-    )
-
-    # Collect the result
-    result = await bus.receive(orch.id, timeout=5.0)
-    if result:
-        print("Output:", result.payload["output"])
-        await bus.acknowledge(result.id)
-
-
-asyncio.run(main())
+result = await bus.receive(orch.id, timeout=5.0)
+if result:
+    print("Output:", result.payload["output"])
+    await bus.acknowledge(result.id)
 ```
 
 ---
 
-### Orchestrator spawning workers
+### Template-driven research task
+
+`TaskRunner` handles all the plumbing — agent creation, MCP server lifecycle, tool registration, bus dispatch, result collection, and teardown. See [`research_agent_orchestrator.py`](research_agent_orchestrator.py).
 
 ```python
-async def run_cluster():
-    # ... setup conn, repo, bus, tracer, logger as above ...
+from orchestrator.task_runner import TaskRunner
 
-    orch = Agent(role=AgentRole.ORCHESTRATOR, cluster_id="research-cluster")
-    repo.create(orch)
-    repo.transition(orch.id, AgentState.INITIALIZING)
-    repo.transition(orch.id, AgentState.IDLE)
+TASK_DESCRIPTION = "What are the main features of Python 3.13?"
 
-    tasks = [
-        "Summarise the introduction of arxiv:2501.00001",
-        "Summarise the conclusion of arxiv:2501.00001",
-    ]
+results = await TaskRunner(
+    template_name="researcher",
+    template_vars={"task_description": TASK_DESCRIPTION},
+    task_descriptions=[TASK_DESCRIPTION],
+).run()
 
-    workers = []
-    for task_text in tasks:
-        w = Agent(
-            role=AgentRole.WORKER,
-            cluster_id="research-cluster",
-            parent_id=orch.id,
-            context={
-                "execution_mode": "messages_api",
-                "system_prompt": "You are a research assistant.",
-            },
-        )
-        repo.create(w)
-        repo.transition(w.id, AgentState.INITIALIZING)
-        repo.transition(w.id, AgentState.IDLE)
-        workers.append(w)
+if results[0]:
+    print(results[0])
+```
 
-        await bus.send(Message(
-            type=MessageType.TASK_ASSIGN,
-            sender_id=orch.id,
-            recipient_id=w.id,
-            cluster_id="research-cluster",
-            payload={"task_id": w.id, "description": task_text},
-        ))
+---
 
-    # Run all workers concurrently
-    runner = MessagesAPIRunner(
-        agent_id="shared",
-        client=anthropic.AsyncAnthropic(),
-        registry=ToolRegistry("shared"),
-        tracer=tracer,
-        logger=logger,
-    )
+### Multiple tasks
 
-    async def worker_loop(w):
-        runner_for_w = MessagesAPIRunner(
-            agent_id=w.id,
-            client=anthropic.AsyncAnthropic(),
-            registry=ToolRegistry(w.id),
-            tracer=tracer,
-            logger=get_logger("agent/" + w.id),
-        )
-        await run_worker(w, bus, repo, tracer, logger, api_runner=runner_for_w)
+Pass multiple descriptions to `TaskRunner` and the worker processes them sequentially, reusing the same MCP connections throughout. See [`multiple_task_orchestrator.py`](multiple_task_orchestrator.py).
 
-    await asyncio.gather(*[worker_loop(w) for w in workers])
+```python
+from orchestrator.task_runner import TaskRunner
 
-    # Collect results
-    for _ in workers:
-        msg = await bus.receive(orch.id, timeout=30.0)
-        if msg:
-            print(f"[{msg.payload['task_id'][:8]}]", msg.payload.get("output", "")[:120])
-            await bus.acknowledge(msg.id)
+TASK_DESCRIPTIONS = [
+    "What are the main features of Python 3.13?",
+    "What are the key differences between Rust and Go for backend development?",
+]
+
+results = await TaskRunner(
+    template_name="researcher",
+    template_vars={"task_description": "Answer research questions"},
+    task_descriptions=TASK_DESCRIPTIONS,
+).run()
+
+for idx, (description, output) in enumerate(zip(TASK_DESCRIPTIONS, results), start=1):
+    print(f"\n--- Result {idx}: {description} ---")
+    print(output if output else "(no result)")
 ```
 
 ---
